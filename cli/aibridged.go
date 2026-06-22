@@ -205,10 +205,12 @@ func BuildProviders(ctx context.Context, db database.Store, cfg codersdk.AIBridg
 }
 
 // buildAIProviderFromRow decodes the settings blob and constructs the
-// appropriate [aibridge.Provider] for a single ai_providers row.
-// Disabled rows return a Provider stub carrying only Name and
-// Disabled: true; settings decode, key loading, and credential checks
-// are skipped because the provider will never call upstream.
+// appropriate [aibridge.Provider] for a single ai_providers row. It is a
+// thin database adapter over [buildProvider]: it extracts the bearer key
+// strings and Bedrock settings from the row and delegates the per-type
+// construction. Disabled rows return a Provider stub; settings decode,
+// key loading, and credential checks are skipped because the provider
+// will never call upstream.
 func buildAIProviderFromRow(
 	row database.AIProvider,
 	keys []database.AIProviderKey,
@@ -224,6 +226,45 @@ func buildAIProviderFromRow(
 		return nil, xerrors.Errorf("decode settings: %w", err)
 	}
 
+	rawKeys := make([]string, 0, len(keys))
+	for _, k := range keys {
+		rawKeys = append(rawKeys, k.APIKey)
+	}
+
+	return buildProvider(aiProviderSpec{
+		Type:    row.Type,
+		Name:    row.Name,
+		Enabled: true,
+		BaseURL: row.BaseUrl,
+		Keys:    rawKeys,
+		Bedrock: settings.Bedrock,
+	}, cfg, metrics)
+}
+
+// aiProviderSpec is a database-neutral description of a single provider,
+// carrying exactly the inputs [buildProvider] needs. Both the database
+// path ([buildAIProviderFromRow]) and the deployment-config path
+// ([BuildProvidersFromConfig]) map their source into this shape so the
+// per-type construction logic stays in one place.
+type aiProviderSpec struct {
+	Type    database.AIProviderType
+	Name    string
+	Enabled bool
+	BaseURL string
+	// Keys holds bearer API keys for non-Bedrock providers.
+	Keys []string
+	// Bedrock holds Bedrock-specific settings when the provider targets
+	// AWS Bedrock; nil otherwise.
+	Bedrock *codersdk.AIProviderBedrockSettings
+}
+
+// buildProvider constructs the appropriate [aibridge.Provider] for a
+// single provider spec, independent of where the spec was sourced from.
+func buildProvider(spec aiProviderSpec, cfg codersdk.AIBridgeConfig, metrics *aibridge.Metrics) (aibridge.Provider, error) {
+	if !spec.Enabled {
+		return aibridge.NewDisabledProviderStub(spec.Name, string(spec.Type)), nil
+	}
+
 	cbCfg := circuitBreakerConfig(cfg)
 	sendActorHeaders := cfg.SendActorHeaders.Value()
 	dumpDir := cfg.APIDumpDir.Value()
@@ -234,27 +275,27 @@ func buildAIProviderFromRow(
 	// provider because chatd configures them against their
 	// OpenAI-compatible endpoints. Bedrock routes through the Anthropic
 	// provider with a Bedrock discriminator in Settings.
-	switch row.Type {
+	switch spec.Type {
 	case database.AIProviderTypeOpenai,
 		database.AIProviderTypeAzure,
 		database.AIProviderTypeGoogle,
 		database.AIProviderTypeOpenaiCompat,
 		database.AIProviderTypeOpenrouter,
 		database.AIProviderTypeVercel:
-		if len(keys) == 0 && !cfg.AllowBYOK.Value() {
-			return nil, xerrors.Errorf("%s provider has no api keys configured and BYOK is not enabled", row.Type)
+		if len(spec.Keys) == 0 && !cfg.AllowBYOK.Value() {
+			return nil, xerrors.Errorf("%s provider has no api keys configured and BYOK is not enabled", spec.Type)
 		}
 		var pool *keypool.Pool
-		if len(keys) > 0 {
+		if len(spec.Keys) > 0 {
 			var err error
-			pool, err = buildAIProviderKeyPool(row.Name, keys, metrics)
+			pool, err = buildAIProviderKeyPool(spec.Name, spec.Keys, metrics)
 			if err != nil {
-				return nil, xerrors.Errorf("%s key pool: %w", row.Type, err)
+				return nil, xerrors.Errorf("%s key pool: %w", spec.Type, err)
 			}
 		}
 		return aibridge.NewOpenAIProvider(aibridge.OpenAIConfig{
-			Name:             row.Name,
-			BaseURL:          row.BaseUrl,
+			Name:             spec.Name,
+			BaseURL:          spec.BaseURL,
 			KeyPool:          pool,
 			APIDumpDir:       dumpDir,
 			CircuitBreaker:   cbCfg,
@@ -262,31 +303,31 @@ func buildAIProviderFromRow(
 		}), nil
 
 	case database.AIProviderTypeAnthropic, database.AIProviderTypeBedrock:
-		bedrock := bedrockConfigFromRow(row, settings)
-		// A row typed 'bedrock' authenticates exclusively via settings;
+		bedrock := bedrockConfig(spec.BaseURL, spec.Bedrock)
+		// A spec typed 'bedrock' authenticates exclusively via settings;
 		// without populated Bedrock credentials it cannot make upstream
 		// calls, so refuse rather than falling back to an unsigned
 		// Anthropic client.
-		if row.Type == database.AIProviderTypeBedrock && bedrock == nil {
+		if spec.Type == database.AIProviderTypeBedrock && bedrock == nil {
 			return nil, xerrors.New("bedrock provider has no bedrock credentials configured")
 		}
 		// Bedrock-backed Anthropic authenticates via AWS credentials in
-		// the settings blob, not the api_keys table. A bearer-token
-		// Anthropic without any key cannot make upstream calls.
-		if bedrock == nil && len(keys) == 0 && !cfg.AllowBYOK.Value() {
+		// the settings blob, not bearer keys. A bearer-token Anthropic
+		// without any key cannot make upstream calls.
+		if bedrock == nil && len(spec.Keys) == 0 && !cfg.AllowBYOK.Value() {
 			return nil, xerrors.New("anthropic provider has no api keys, no bedrock credentials, and BYOK is not enabled")
 		}
 		var pool *keypool.Pool
-		if len(keys) > 0 {
+		if len(spec.Keys) > 0 {
 			var err error
-			pool, err = buildAIProviderKeyPool(row.Name, keys, metrics)
+			pool, err = buildAIProviderKeyPool(spec.Name, spec.Keys, metrics)
 			if err != nil {
 				return nil, xerrors.Errorf("anthropic key pool: %w", err)
 			}
 		}
 		return aibridge.NewAnthropicProvider(aibridge.AnthropicConfig{
-			Name:             row.Name,
-			BaseURL:          row.BaseUrl,
+			Name:             spec.Name,
+			BaseURL:          spec.BaseURL,
 			KeyPool:          pool,
 			APIDumpDir:       dumpDir,
 			CircuitBreaker:   cbCfg,
@@ -297,15 +338,50 @@ func buildAIProviderFromRow(
 		// Copilot is always BYOK; the per-user token is supplied on each
 		// request via the Authorization header, so no keypool is built.
 		return aibridge.NewCopilotProvider(aibridge.CopilotConfig{
-			Name:           row.Name,
-			BaseURL:        row.BaseUrl,
+			Name:           spec.Name,
+			BaseURL:        spec.BaseURL,
 			APIDumpDir:     dumpDir,
 			CircuitBreaker: cbCfg,
 		}), nil
 
 	default:
-		return nil, xerrors.Errorf("unsupported provider type: %q", row.Type)
+		return nil, xerrors.Errorf("unsupported provider type: %q", spec.Type)
 	}
+}
+
+// BuildProvidersFromConfig constructs the runtime [aibridge.Provider]
+// set directly from deployment configuration, without any database
+// access. It is used by the standalone AI Gateway (`coder aibridge
+// start`), which connects to coderd only over DRPC and cannot read the
+// ai_providers tables. Per-provider construction errors are logged and
+// the offending provider is skipped, mirroring [BuildProviders].
+func BuildProvidersFromConfig(ctx context.Context, cfg codersdk.AIBridgeConfig, logger slog.Logger, metrics *aibridge.Metrics) ([]aibridge.Provider, error) {
+	specs, err := coderd.ProvidersFromConfig(ctx, cfg, logger)
+	if err != nil {
+		return nil, xerrors.Errorf("normalize ai providers from config: %w", err)
+	}
+
+	providers := make([]aibridge.Provider, 0, len(specs))
+	for _, s := range specs {
+		prov, err := buildProvider(aiProviderSpec{
+			Type:    s.Type,
+			Name:    s.Name,
+			Enabled: true,
+			BaseURL: s.BaseURL,
+			Keys:    s.Keys,
+			Bedrock: s.Bedrock,
+		}, cfg, metrics)
+		if err != nil {
+			logger.Error(ctx, "skipping misconfigured ai provider",
+				slog.F("provider_name", s.Name),
+				slog.F("provider_type", string(s.Type)),
+				slog.Error(err),
+			)
+			continue
+		}
+		providers = append(providers, prov)
+	}
+	return providers, nil
 }
 
 // disabledProviderFromRow builds a Provider stub for a disabled row.
@@ -318,31 +394,27 @@ func disabledProviderFromRow(row database.AIProvider) (aibridge.Provider, error)
 
 // buildAIProviderKeyPool builds a [keypool.Pool]. Callers must check
 // len(keys) > 0 first; keypool.New rejects empty input.
-func buildAIProviderKeyPool(providerName string, keys []database.AIProviderKey, metrics *aibridge.Metrics) (*keypool.Pool, error) {
-	raw := make([]string, 0, len(keys))
-	for _, k := range keys {
-		raw = append(raw, k.APIKey)
-	}
-	return keypool.New(providerName, raw, quartz.NewReal(), metrics)
+func buildAIProviderKeyPool(providerName string, keys []string, metrics *aibridge.Metrics) (*keypool.Pool, error) {
+	return keypool.New(providerName, keys, quartz.NewReal(), metrics)
 }
 
-// bedrockConfigFromRow returns nil when the settings have no Bedrock
-// discriminator or when the Bedrock fields are not actually configured.
-// The provider row's BaseUrl is the generic upstream endpoint and is
-// always non-empty, so it cannot serve as a Bedrock detection signal;
-// gate on the settings blob alone via [codersdk.AIProviderBedrockSettings.IsConfigured].
-func bedrockConfigFromRow(row database.AIProvider, settings codersdk.AIProviderSettings) *aibridge.AWSBedrockConfig {
-	if settings.Bedrock == nil {
+// bedrockConfig returns nil when the settings are absent or when the
+// Bedrock fields are not actually configured. The provider's BaseURL is
+// the generic upstream endpoint and is always non-empty, so it cannot
+// serve as a Bedrock detection signal; gate on the settings alone via
+// [codersdk.AIProviderBedrockSettings.IsConfigured].
+func bedrockConfig(baseURL string, bedrock *codersdk.AIProviderBedrockSettings) *aibridge.AWSBedrockConfig {
+	if bedrock == nil {
 		return nil
 	}
-	bedrockSettings := *settings.Bedrock
+	bedrockSettings := *bedrock
 	if !bedrockSettings.IsConfigured() {
 		return nil
 	}
 	accessKey := ptr.NilToEmpty(bedrockSettings.AccessKey)
 	accessKeySecret := ptr.NilToEmpty(bedrockSettings.AccessKeySecret)
 	return &aibridge.AWSBedrockConfig{
-		BaseURL:         row.BaseUrl,
+		BaseURL:         baseURL,
 		Region:          bedrockSettings.Region,
 		AccessKey:       accessKey,
 		AccessKeySecret: accessKeySecret,
