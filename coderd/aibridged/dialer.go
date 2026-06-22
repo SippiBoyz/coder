@@ -62,8 +62,8 @@ func NewWebsocketDialer(client *codersdk.Client, key string) Dialer {
 			}
 			return nil, codersdk.ReadBodyAsError(res)
 		}
-		// Align with the frame size of yamux.
-		conn.SetReadLimit(256 * 1024)
+		// Align with yamux's default stream window size.
+		conn.SetReadLimit(drpcsdk.YamuxDefaultStreamWindowSize)
 
 		config := yamux.DefaultConfig()
 		config.LogOutput = io.Discard
