@@ -100,7 +100,7 @@ func Test_New(t *testing.T) {
 
 	t.Run("ConnectionCount", func(t *testing.T) {
 		t.Parallel()
-		ps := newTestPubsub(t, defaultTestOptions())
+		ps := newTestPubsub(t, defaultTestOptions(), nil)
 		t.Cleanup(func() { _ = ps.Close() })
 
 		const n = 50
@@ -131,7 +131,7 @@ func Test_SubscribeWithErr(t *testing.T) {
 		t.Parallel()
 		logger := slogtest.Make(t, nil)
 		ctx := testutil.Context(t, testutil.WaitShort)
-		ps, err := New(ctx, logger, defaultTestOptions())
+		ps, err := New(ctx, logger, defaultTestOptions(), nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = ps.Close() })
 
@@ -278,7 +278,7 @@ func Test_localSub_init(t *testing.T) {
 		t.Parallel()
 		logger := slogtest.Make(t, nil)
 		ctx := testutil.Context(t, testutil.WaitLong)
-		ps, err := New(ctx, logger, defaultTestOptions())
+		ps, err := New(ctx, logger, defaultTestOptions(), nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = ps.Close() })
 
@@ -342,9 +342,9 @@ func TestPubsubCluster(t *testing.T) {
 		t.Parallel()
 
 		opts := clusterTestOptions(t)
-		a := newTestPubsub(t, opts)
-		b := newTestPubsub(t, opts)
-		c := newTestPubsub(t, opts)
+		a := newTestPubsub(t, opts, nil)
+		b := newTestPubsub(t, opts, nil)
+		c := newTestPubsub(t, opts, nil)
 
 		addrB := clusterRouteAddress(t, b)
 		addrC := clusterRouteAddress(t, c)
@@ -421,7 +421,7 @@ func TestPubsubCluster(t *testing.T) {
 	t.Run("ClusterAuthRequired", func(t *testing.T) {
 		t.Parallel()
 
-		ps := newTestPubsub(t, clusterTestOptions(t))
+		ps := newTestPubsub(t, clusterTestOptions(t), nil)
 		routeURL := clusterRouteAddress(t, ps)
 
 		_, err := natsgo.Connect(routeURL,
@@ -448,7 +448,7 @@ func TestPubsubCluster(t *testing.T) {
 		t.Parallel()
 
 		opts := clusterTestOptions(t)
-		ps := newTestPubsub(t, opts)
+		ps := newTestPubsub(t, opts, nil)
 		clientURL := ps.Server.ClientURL()
 
 		_, err := natsgo.Connect(clientURL,
@@ -482,11 +482,11 @@ func clusterTestOptions(t *testing.T) Options {
 	}
 }
 
-func newTestPubsub(t *testing.T, opts Options) *Pubsub {
+func newTestPubsub(t *testing.T, opts Options, tls *ClusterTLSOptions) *Pubsub {
 	t.Helper()
 	logger := slogtest.Make(t, nil)
 	ctx := testutil.Context(t, testutil.WaitLong)
-	ps, err := New(ctx, logger, opts)
+	ps, err := New(ctx, logger, opts, tls)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = ps.Close()

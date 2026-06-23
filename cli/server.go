@@ -794,7 +794,7 @@ func (r *RootCmd) Server(newAPI func(context.Context, *coderd.Options) (*coderd.
 				token := fmt.Sprintf("%x", sha256.Sum256([]byte(dbURL)))
 				natsps, err := nats.New(ctx, logger.Named("pubsub"), nats.Options{
 					ClusterAuthToken: token,
-				})
+				}, nil)
 				if err != nil {
 					return xerrors.Errorf("create nats pubsub: %w", err)
 				}
