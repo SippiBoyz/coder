@@ -79,10 +79,11 @@ func NewWebsocketDialer(client *codersdk.Client, key string) Dialer {
 
 		dconn := drpcsdk.MultiplexedConn(session)
 		return &Client{
-			Conn:                      dconn,
-			DRPCRecorderClient:        aibridgedproto.NewDRPCRecorderClient(dconn),
-			DRPCMCPConfiguratorClient: aibridgedproto.NewDRPCMCPConfiguratorClient(dconn),
-			DRPCAuthorizerClient:      aibridgedproto.NewDRPCAuthorizerClient(dconn),
+			Conn:                           dconn,
+			DRPCRecorderClient:             aibridgedproto.NewDRPCRecorderClient(dconn),
+			DRPCMCPConfiguratorClient:      aibridgedproto.NewDRPCMCPConfiguratorClient(dconn),
+			DRPCAuthorizerClient:           aibridgedproto.NewDRPCAuthorizerClient(dconn),
+			DRPCProviderConfiguratorClient: aibridgedproto.NewDRPCProviderConfiguratorClient(dconn),
 		}, nil
 	}
 }

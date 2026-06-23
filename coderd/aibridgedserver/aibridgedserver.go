@@ -80,6 +80,13 @@ type store interface {
 	// Authorizer-related queries.
 	GetAPIKeyByID(ctx context.Context, id string) (database.APIKey, error)
 	GetUserByID(ctx context.Context, id uuid.UUID) (database.User, error)
+
+	// ProviderConfigurator-related queries. InTx wraps the provider and key
+	// reads in a single read-only transaction; AcquireLock serializes against
+	// any in-flight env seed holding LockIDAIProvidersEnvSeed.
+	InTx(func(database.Store) error, *database.TxOptions) error
+	GetAIProviders(ctx context.Context, arg database.GetAIProvidersParams) ([]database.AIProvider, error)
+	GetAIProviderKeysByProviderIDs(ctx context.Context, providerIDs []uuid.UUID) ([]database.AIProviderKey, error)
 }
 
 type Server struct {

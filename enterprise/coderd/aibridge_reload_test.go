@@ -20,8 +20,8 @@ import (
 	"github.com/coder/coder/v2/cli"
 	"github.com/coder/coder/v2/coderd"
 	"github.com/coder/coder/v2/coderd/aibridged"
+	"github.com/coder/coder/v2/coderd/aibridged/proto"
 	"github.com/coder/coder/v2/coderd/coderdtest"
-	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/enterprise/coderd/coderdenttest"
 	"github.com/coder/coder/v2/enterprise/coderd/license"
@@ -64,18 +64,13 @@ func startTestAIBridgeDaemon(t *testing.T, api *coderd.API) *aibridged.Metrics {
 	cfg := api.DeploymentValues.AI.BridgeConfig
 	tracer := otel.Tracer("aibridge-reload-test")
 
-	providers, _, err := cli.BuildProviders(ctx, api.Database, cfg, logger, nil)
-	require.NoError(t, err)
-
-	pool, err := aibridged.NewCachedBridgePool(aibridged.DefaultPoolOptions, providers, logger.Named("pool"), nil, tracer)
+	// Start with an empty pool and populate it via the in-memory RPC, exactly
+	// like cli.newAIBridgeDaemon does in production.
+	pool, err := aibridged.NewCachedBridgePool(aibridged.DefaultPoolOptions, nil, logger.Named("pool"), nil, tracer)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = pool.Shutdown(context.Background()) })
 
 	metrics := aibridged.NewMetrics(prometheus.NewRegistry())
-	reloader := &testPoolReloader{pool: pool, db: api.Database, cfg: cfg, logger: logger.Named("reloader"), metrics: metrics}
-	unsubscribe, err := aibridged.SubscribeProviderReload(ctx, api.Pubsub, reloader, logger.Named("subscriber"))
-	require.NoError(t, err)
-	t.Cleanup(unsubscribe)
 
 	srv, err := aibridged.New(ctx, pool, func(dialCtx context.Context) (aibridged.DRPCClient, error) {
 		return api.CreateInMemoryAIBridgeServer(dialCtx)
@@ -83,13 +78,25 @@ func startTestAIBridgeDaemon(t *testing.T, api *coderd.API) *aibridged.Metrics {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = srv.Close() })
 
+	reloader := &testPoolReloader{pool: pool, client: srv.Client, cfg: cfg, logger: logger.Named("reloader"), metrics: metrics}
+	unsubscribe, err := aibridged.SubscribeProviderReload(ctx, api.Pubsub, reloader, logger.Named("subscriber"), aibridged.WithDeferredInitialReload())
+	require.NoError(t, err)
+	t.Cleanup(unsubscribe)
+	// The initial reload blocks on srv.Client(); run it asynchronously so the
+	// helper does not park on the in-memory connection establishing.
+	go func() {
+		if err := reloader.Reload(ctx); err != nil {
+			logger.Warn(ctx, "initial ai provider reload", slog.Error(err))
+		}
+	}()
+
 	api.RegisterInMemoryAIBridgedHTTPHandler(srv)
 	return metrics
 }
 
 type testPoolReloader struct {
 	pool    *aibridged.CachedBridgePool
-	db      database.Store
+	client  func() (aibridged.DRPCClient, error)
 	cfg     codersdk.AIBridgeConfig
 	logger  slog.Logger
 	metrics *aibridged.Metrics
@@ -97,10 +104,15 @@ type testPoolReloader struct {
 
 func (r *testPoolReloader) Reload(ctx context.Context) error {
 	defer r.metrics.RecordReloadAttempt()
-	providers, outcomes, err := cli.BuildProviders(ctx, r.db, r.cfg, r.logger, nil)
+	client, err := r.client()
 	if err != nil {
 		return err
 	}
+	resp, err := client.GetAIProviders(ctx, &proto.GetAIProvidersRequest{})
+	if err != nil {
+		return err
+	}
+	providers, outcomes := cli.BuildProvidersFromProto(ctx, resp.GetProviders(), r.cfg, r.logger, nil)
 	r.pool.ReplaceProviders(providers)
 	r.metrics.RecordReloadSuccess(outcomes)
 	return nil

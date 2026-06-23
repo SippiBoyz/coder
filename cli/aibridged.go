@@ -6,7 +6,6 @@ import (
 	"context"
 	"slices"
 
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/xerrors"
 
@@ -16,9 +15,8 @@ import (
 	"github.com/coder/coder/v2/aibridge/keypool"
 	"github.com/coder/coder/v2/coderd"
 	"github.com/coder/coder/v2/coderd/aibridged"
+	"github.com/coder/coder/v2/coderd/aibridged/proto"
 	"github.com/coder/coder/v2/coderd/database"
-	"github.com/coder/coder/v2/coderd/database/db2sdk"
-	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/tracing"
 	"github.com/coder/coder/v2/coderd/util/ptr"
 	"github.com/coder/coder/v2/codersdk"
@@ -26,11 +24,17 @@ import (
 )
 
 // newAIBridgeDaemon constructs the in-memory aibridge daemon and wires
-// up a subscription that hot-reloads the provider pool from the
-// database on every ai_providers change event. The returned unsubscribe
+// up a subscription that hot-reloads the provider pool over the in-memory
+// RPC on every ai_providers change event. The returned unsubscribe
 // function tears down the subscription; callers must invoke it
 // alongside Server.Close on shutdown.
-func newAIBridgeDaemon(coderAPI *coderd.API, providers []aibridge.Provider, cfg codersdk.AIBridgeConfig, reg prometheus.Registerer, metrics *aibridge.Metrics) (*aibridged.Server, func(), error) {
+//
+// The pool starts empty: the daemon serves a 503 sentinel until the first
+// reload completes. Reloads fetch the provider set from coderd over the
+// in-memory DRPC (GetAIProviders) rather than reading the database directly,
+// so embedded and standalone gateways construct providers identically. Pubsub
+// remains the hot-reload trigger; only the data path changed.
+func newAIBridgeDaemon(coderAPI *coderd.API, cfg codersdk.AIBridgeConfig, reg prometheus.Registerer, metrics *aibridge.Metrics) (*aibridged.Server, func(), error) {
 	ctx := context.Background()
 	coderAPI.Logger.Debug(ctx, "starting in-memory aibridge daemon")
 
@@ -39,8 +43,10 @@ func newAIBridgeDaemon(coderAPI *coderd.API, providers []aibridge.Provider, cfg 
 	providerMetrics := aibridged.NewMetrics(reg)
 	tracer := coderAPI.TracerProvider.Tracer(tracing.TracerName)
 
-	// Create pool for reusable stateful [aibridge.RequestBridge] instances (one per user).
-	pool, err := aibridged.NewCachedBridgePool(aibridged.DefaultPoolOptions, providers, logger.Named("pool"), metrics, tracer) // TODO: configurable size.
+	// Create an empty pool for reusable stateful [aibridge.RequestBridge]
+	// instances (one per user). The reloader populates it after the daemon
+	// connects to coderd.
+	pool, err := aibridged.NewCachedBridgePool(aibridged.DefaultPoolOptions, nil, logger.Named("pool"), metrics, tracer) // TODO: configurable size.
 	if err != nil {
 		return nil, nil, xerrors.Errorf("create request pool: %w", err)
 	}
@@ -48,147 +54,118 @@ func newAIBridgeDaemon(coderAPI *coderd.API, providers []aibridge.Provider, cfg 
 	// Report current key pool state per provider at scrape time.
 	reg.MustRegister(keypool.NewStateCollector(pool.KeyPools))
 
+	// Create daemon. Construct it before subscribing so the reloader can use
+	// srv.Client() to fetch providers over the in-memory RPC.
+	srv, err := aibridged.New(ctx, pool, func(dialCtx context.Context) (aibridged.DRPCClient, error) {
+		return coderAPI.CreateInMemoryAIBridgeServer(dialCtx)
+	}, logger, tracer)
+	if err != nil {
+		return nil, nil, xerrors.Errorf("start in-memory aibridge daemon: %w", err)
+	}
+
 	// Subscribe to ai_providers change events so the pool tracks the
-	// database without a restart. The boot-time `providers` snapshot
-	// derives from env config and serves as a fallback if the database
-	// load fails inside the reloader.
-	reloader := &poolDBReloader{
+	// database without a restart. The reload data path is the in-memory RPC,
+	// so the reloader's Reload blocks on srv.Client() until the daemon
+	// connects; the initial reload is therefore deferred and kicked off
+	// asynchronously below so startup does not park.
+	reloader := &poolRPCReloader{
 		pool:            pool,
-		db:              coderAPI.Database,
+		client:          srv.Client,
 		cfg:             cfg,
 		logger:          logger.Named("provider-loader"),
 		aibridgeMetrics: metrics,
 		providerMetrics: providerMetrics,
 	}
-	unsubscribe, err := aibridged.SubscribeProviderReload(ctx, coderAPI.Pubsub, reloader, logger.Named("provider-reload"))
+	unsubscribe, err := aibridged.SubscribeProviderReload(ctx, coderAPI.Pubsub, reloader, logger.Named("provider-reload"), aibridged.WithDeferredInitialReload())
 	if err != nil {
-		// Pool is still usable with the boot-time snapshot; subscription
+		// Pool is still usable (empty until a reload succeeds); subscription
 		// failure is logged but not fatal so the daemon still serves.
 		logger.Warn(ctx, "subscribe to ai providers change channel", slog.Error(err))
 		unsubscribe = func() {}
 	}
 
-	// Create daemon.
-	srv, err := aibridged.New(ctx, pool, func(dialCtx context.Context) (aibridged.DRPCClient, error) {
-		return coderAPI.CreateInMemoryAIBridgeServer(dialCtx)
-	}, logger, tracer)
-	if err != nil {
-		unsubscribe()
-		return nil, nil, xerrors.Errorf("start in-memory aibridge daemon: %w", err)
-	}
+	// Kick off the initial reload asynchronously so startup does not park on
+	// srv.Client() waiting for the in-memory connection to establish.
+	go func() {
+		if err := reloader.Reload(ctx); err != nil {
+			logger.Warn(ctx, "initial ai provider reload", slog.Error(err))
+		}
+	}()
+
 	return srv, unsubscribe, nil
 }
 
-// poolDBReloader implements [aibridged.ProviderReloader] by loading
-// the live provider set from the database and forwarding it to the
-// pool.
-type poolDBReloader struct {
+// poolRPCReloader implements [aibridged.ProviderReloader] by fetching the
+// live provider set from coderd over the in-memory RPC and forwarding it to
+// the pool.
+type poolRPCReloader struct {
 	pool            *aibridged.CachedBridgePool
-	db              database.Store
+	client          func() (aibridged.DRPCClient, error)
 	cfg             codersdk.AIBridgeConfig
 	logger          slog.Logger
 	aibridgeMetrics *aibridge.Metrics
 	providerMetrics *aibridged.Metrics
 }
 
-func (r *poolDBReloader) Reload(ctx context.Context) error {
+func (r *poolRPCReloader) Reload(ctx context.Context) error {
 	r.providerMetrics.RecordReloadAttempt()
-	providers, outcomes, err := BuildProviders(ctx, r.db, r.cfg, r.logger, r.aibridgeMetrics)
+	// srv.Client() blocks until the daemon is connected to coderd.
+	client, err := r.client()
+	if err != nil {
+		return xerrors.Errorf("get aibridge client: %w", err)
+	}
+	resp, err := client.GetAIProviders(ctx, &proto.GetAIProvidersRequest{})
 	if err != nil {
 		// Keep the previous snapshot in place: dropping all providers
-		// because the DB read failed would compound the visible failure
-		// mode beyond the operator's actual misconfiguration.
-		return xerrors.Errorf("load ai providers from database: %w", err)
+		// because the fetch failed would compound the visible failure mode
+		// beyond the operator's actual misconfiguration.
+		return xerrors.Errorf("fetch ai providers: %w", err)
 	}
+	providers, outcomes := BuildProvidersFromProto(ctx, resp.GetProviders(), r.cfg, r.logger, r.aibridgeMetrics)
 	r.pool.ReplaceProviders(providers)
 	r.providerMetrics.RecordReloadSuccess(outcomes)
 	return nil
 }
 
-// BuildProviders loads all ai_providers rows (enabled and disabled),
-// attaches keys to enabled rows, and constructs the equivalent
-// [aibridge.Provider] instances. The database is the single source of
-// truth for runtime provider configuration.
+// BuildProvidersFromProto constructs the runtime [aibridge.Provider] set from
+// the proto provider configuration fetched from coderd over DRPC
+// (GetAIProviders). The database is the single source of truth; coderd reads
+// it server-side and serves the rows here, so embedded and standalone gateways
+// build providers identically.
 //
-// Disabled rows produce a Provider stub with Enabled() == false so the
+// Disabled entries produce a Provider stub with Enabled() == false so the
 // bridge can answer requests targeting them with a 503 sentinel.
 //
-// Per-provider construction errors are logged and the offending row is
-// excluded from the returned snapshot; only a failure of the DB query
-// itself is propagated. This keeps a single misconfigured row from
-// taking the whole daemon down.
-func BuildProviders(ctx context.Context, db database.Store, cfg codersdk.AIBridgeConfig, logger slog.Logger, metrics *aibridge.Metrics) ([]aibridge.Provider, []aibridged.ProviderOutcome, error) {
-	//nolint:gocritic // AsAIBridged has a minimal permission set for this purpose.
-	authCtx := dbauthz.AsAIBridged(ctx)
-
-	var rows []database.AIProvider
-	keysByProvider := make(map[uuid.UUID][]database.AIProviderKey)
-
-	// Wrap both queries in a read-only transaction so the provider list
-	// and the key list are consistent with each other.
-	err := db.InTx(func(tx database.Store) error {
-		var err error
-		rows, err = tx.GetAIProviders(authCtx, database.GetAIProvidersParams{
-			IncludeDisabled: true,
-		})
-		if err != nil {
-			return xerrors.Errorf("load ai providers: %w", err)
-		}
-
-		if len(rows) == 0 {
-			return nil
-		}
-
-		// Load keys only for the enabled providers to avoid materializing
-		// secrets for disabled rows.
-		ids := make([]uuid.UUID, 0, len(rows))
-		for _, r := range rows {
-			if !r.Enabled {
-				continue
-			}
-			ids = append(ids, r.ID)
-		}
-		if len(ids) == 0 {
-			return nil
-		}
-		keyRows, err := tx.GetAIProviderKeysByProviderIDs(authCtx, ids)
-		if err != nil {
-			return xerrors.Errorf("load ai provider keys: %w", err)
-		}
-		for _, k := range keyRows {
-			keysByProvider[k.ProviderID] = append(keysByProvider[k.ProviderID], k)
-		}
-		return nil
-	}, &database.TxOptions{ReadOnly: true, TxIdentifier: "build_ai_providers"})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	providers := make([]aibridge.Provider, 0, len(rows))
-	outcomes := make([]aibridged.ProviderOutcome, 0, len(rows))
+// Per-provider construction errors are logged and the offending entry is
+// excluded from the returned snapshot; this keeps a single misconfigured
+// provider from taking the whole daemon down. The returned outcomes mirror the
+// per-provider status for metrics reporting.
+func BuildProvidersFromProto(ctx context.Context, protoProviders []*proto.AIProvider, cfg codersdk.AIBridgeConfig, logger slog.Logger, metrics *aibridge.Metrics) ([]aibridge.Provider, []aibridged.ProviderOutcome) {
+	providers := make([]aibridge.Provider, 0, len(protoProviders))
+	outcomes := make([]aibridged.ProviderOutcome, 0, len(protoProviders))
 	enabledCount := 0
-	for _, row := range rows {
+	for _, pp := range protoProviders {
+		spec := protoToProviderSpec(pp)
 		outcome := aibridged.ProviderOutcome{
-			Name: row.Name,
-			Type: string(row.Type),
+			Name: spec.Name,
+			Type: string(spec.Type),
 		}
-		if row.Enabled {
+		if spec.Enabled {
 			enabledCount++
 		}
-		prov, err := buildAIProviderFromRow(row, keysByProvider[row.ID], cfg, metrics)
+		prov, err := buildProvider(spec, cfg, metrics)
 		if err != nil {
 			outcome.Status = aibridged.ProviderStatusError
 			outcome.Err = err
 			outcomes = append(outcomes, outcome)
 			logger.Error(ctx, "skipping misconfigured ai provider",
-				slog.F("provider_id", row.ID),
-				slog.F("provider_name", row.Name),
-				slog.F("provider_type", string(row.Type)),
+				slog.F("provider_name", spec.Name),
+				slog.F("provider_type", string(spec.Type)),
 				slog.Error(err),
 			)
 			continue
 		}
-		if row.Enabled {
+		if spec.Enabled {
 			outcome.Status = aibridged.ProviderStatusEnabled
 		} else {
 			outcome.Status = aibridged.ProviderStatusDisabled
@@ -201,50 +178,36 @@ func BuildProviders(ctx context.Context, db database.Store, cfg codersdk.AIBridg
 		logger.Warn(ctx, "all enabled ai providers failed to build; only disabled providers remain")
 	}
 
-	return providers, outcomes, nil
+	return providers, outcomes
 }
 
-// buildAIProviderFromRow decodes the settings blob and constructs the
-// appropriate [aibridge.Provider] for a single ai_providers row. It is a
-// thin database adapter over [buildProvider]: it extracts the bearer key
-// strings and Bedrock settings from the row and delegates the per-type
-// construction. Disabled rows return a Provider stub; settings decode,
-// key loading, and credential checks are skipped because the provider
-// will never call upstream.
-func buildAIProviderFromRow(
-	row database.AIProvider,
-	keys []database.AIProviderKey,
-	cfg codersdk.AIBridgeConfig,
-	metrics *aibridge.Metrics,
-) (aibridge.Provider, error) {
-	if !row.Enabled {
-		return disabledProviderFromRow(row)
+// protoToProviderSpec maps a proto [proto.AIProvider] into the database-neutral
+// [aiProviderSpec] consumed by [buildProvider]. Keys and Bedrock settings are
+// only meaningful for enabled providers; disabled providers carry neither over
+// the wire.
+func protoToProviderSpec(pp *proto.AIProvider) aiProviderSpec {
+	spec := aiProviderSpec{
+		Type:    database.AIProviderType(pp.GetType()),
+		Name:    pp.GetName(),
+		Enabled: pp.GetEnabled(),
+		BaseURL: pp.GetBaseUrl(),
+		Keys:    pp.GetKeys(),
 	}
-
-	settings, err := db2sdk.AIProviderSettings(row.Settings)
-	if err != nil {
-		return nil, xerrors.Errorf("decode settings: %w", err)
+	if b := pp.GetBedrock(); b != nil {
+		spec.Bedrock = ptr.Ref(codersdk.NewAIProviderBedrockSettings(
+			b.GetRegion(),
+			b.GetAccessKey(),
+			b.GetAccessKeySecret(),
+			b.GetModel(),
+			b.GetSmallFastModel(),
+		))
 	}
-
-	rawKeys := make([]string, 0, len(keys))
-	for _, k := range keys {
-		rawKeys = append(rawKeys, k.APIKey)
-	}
-
-	return buildProvider(aiProviderSpec{
-		Type:    row.Type,
-		Name:    row.Name,
-		Enabled: true,
-		BaseURL: row.BaseUrl,
-		Keys:    rawKeys,
-		Bedrock: settings.Bedrock,
-	}, cfg, metrics)
+	return spec
 }
 
 // aiProviderSpec is a database-neutral description of a single provider,
-// carrying exactly the inputs [buildProvider] needs. Both the database
-// path ([buildAIProviderFromRow]) and the deployment-config path
-// ([BuildProvidersFromConfig]) map their source into this shape so the
+// carrying exactly the inputs [buildProvider] needs. The RPC path
+// ([protoToProviderSpec]) maps the proto provider into this shape so the
 // per-type construction logic stays in one place.
 type aiProviderSpec struct {
 	Type    database.AIProviderType
@@ -347,49 +310,6 @@ func buildProvider(spec aiProviderSpec, cfg codersdk.AIBridgeConfig, metrics *ai
 	default:
 		return nil, xerrors.Errorf("unsupported provider type: %q", spec.Type)
 	}
-}
-
-// BuildProvidersFromConfig constructs the runtime [aibridge.Provider]
-// set directly from deployment configuration, without any database
-// access. It is used by the standalone AI Gateway (`coder aibridge
-// start`), which connects to coderd only over DRPC and cannot read the
-// ai_providers tables. Per-provider construction errors are logged and
-// the offending provider is skipped, mirroring [BuildProviders].
-func BuildProvidersFromConfig(ctx context.Context, cfg codersdk.AIBridgeConfig, logger slog.Logger, metrics *aibridge.Metrics) ([]aibridge.Provider, error) {
-	specs, err := coderd.ProvidersFromConfig(ctx, cfg, logger)
-	if err != nil {
-		return nil, xerrors.Errorf("normalize ai providers from config: %w", err)
-	}
-
-	providers := make([]aibridge.Provider, 0, len(specs))
-	for _, s := range specs {
-		prov, err := buildProvider(aiProviderSpec{
-			Type:    s.Type,
-			Name:    s.Name,
-			Enabled: true,
-			BaseURL: s.BaseURL,
-			Keys:    s.Keys,
-			Bedrock: s.Bedrock,
-		}, cfg, metrics)
-		if err != nil {
-			logger.Error(ctx, "skipping misconfigured ai provider",
-				slog.F("provider_name", s.Name),
-				slog.F("provider_type", string(s.Type)),
-				slog.Error(err),
-			)
-			continue
-		}
-		providers = append(providers, prov)
-	}
-	return providers, nil
-}
-
-// disabledProviderFromRow builds a Provider stub for a disabled row.
-// Using provider.DisabledStub rather than a concrete provider avoids
-// duplicating the row.Type switch and ensures that a new AIProviderType
-// value is automatically handled without requiring a matching case here.
-func disabledProviderFromRow(row database.AIProvider) (aibridge.Provider, error) {
-	return aibridge.NewDisabledProviderStub(row.Name, string(row.Type)), nil
 }
 
 // buildAIProviderKeyPool builds a [keypool.Pool]. Callers must check

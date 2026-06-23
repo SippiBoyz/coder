@@ -36,6 +36,17 @@ service Authorizer {
   rpc IsAuthorized(IsAuthorizedRequest) returns (IsAuthorizedResponse);
 }
 
+// ProviderConfigurator serves AI provider configuration to embedded and
+// standalone AI Gateway daemons. The database is the single source of truth;
+// coderd seeds it from the environment.
+service ProviderConfigurator {
+  // GetAIProviders returns the full provider set (enabled and disabled).
+  // The server blocks on LockIDAIProvidersEnvSeed so the response is never a
+  // partial, mid-seed snapshot.
+  rpc GetAIProviders(GetAIProvidersRequest) returns (GetAIProvidersResponse);
+  // 465 later adds: rpc WatchAIProviders(...) returns (stream ...);
+}
+
 message RecordInterceptionRequest {
   string id = 1; // UUID.
   string initiator_id = 2; // UUID.
@@ -158,4 +169,29 @@ message IsAuthorizedResponse {
   string owner_id = 1;
   string api_key_id = 2;
   string username = 3;
+}
+
+message GetAIProvidersRequest {}
+
+message GetAIProvidersResponse {
+  repeated AIProvider providers = 1;
+}
+
+message AIProvider {
+  string name = 1;
+  string type = 2;
+  bool enabled = 3;
+  string base_url = 4;
+  // keys carries bearer API keys, populated only for enabled providers.
+  repeated string keys = 5;
+  // bedrock is set only when the provider authenticates via AWS Bedrock.
+  AIProviderBedrock bedrock = 6;
+}
+
+message AIProviderBedrock {
+  string region = 1;
+  string access_key = 2;
+  string access_key_secret = 3;
+  string model = 4;
+  string small_fast_model = 5;
 }

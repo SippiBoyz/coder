@@ -15,18 +15,43 @@ type ProviderReloader interface {
 	Reload(ctx context.Context) error
 }
 
-// SubscribeProviderReload refreshes once, then on AI provider changes.
+type subscribeConfig struct {
+	deferInitialReload bool
+}
+
+// SubscribeOption customizes [SubscribeProviderReload].
+type SubscribeOption func(*subscribeConfig)
+
+// WithDeferredInitialReload skips the synchronous initial reload that
+// [SubscribeProviderReload] performs before returning. Callers whose Reload
+// blocks (e.g. on an RPC client that is not yet connected) use this to avoid
+// parking startup, and are responsible for triggering the initial reload
+// themselves (typically asynchronously).
+func WithDeferredInitialReload() SubscribeOption {
+	return func(c *subscribeConfig) {
+		c.deferInitialReload = true
+	}
+}
+
+// SubscribeProviderReload refreshes once, then on AI provider changes. The
+// initial synchronous reload can be deferred via [WithDeferredInitialReload].
 func SubscribeProviderReload(
 	ctx context.Context,
 	ps dbpubsub.Pubsub,
 	reloader ProviderReloader,
 	logger slog.Logger,
+	opts ...SubscribeOption,
 ) (func(), error) {
 	if ps == nil {
 		return nil, xerrors.New("pubsub is required")
 	}
 	if reloader == nil {
 		return nil, xerrors.New("reloader is required")
+	}
+
+	var cfg subscribeConfig
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 
 	unsubscribe, err := ps.SubscribeWithErr(pubsub.AIProvidersChangedChannel, func(cbCtx context.Context, _ []byte, err error) {
@@ -43,8 +68,10 @@ func SubscribeProviderReload(
 	if err != nil {
 		return nil, xerrors.Errorf("subscribe to %s: %w", pubsub.AIProvidersChangedChannel, err)
 	}
-	if err := reloader.Reload(ctx); err != nil {
-		logger.Warn(ctx, "initial ai provider reload", slog.Error(err))
+	if !cfg.deferInitialReload {
+		if err := reloader.Reload(ctx); err != nil {
+			logger.Warn(ctx, "initial ai provider reload", slog.Error(err))
+		}
 	}
 	return unsubscribe, nil
 }

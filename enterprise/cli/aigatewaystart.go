@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -19,7 +18,9 @@ import (
 	"github.com/coder/coder/v2/aibridge"
 	agpl "github.com/coder/coder/v2/cli"
 	"github.com/coder/coder/v2/coderd/aibridged"
+	"github.com/coder/coder/v2/coderd/aibridged/proto"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/retry"
 	"github.com/coder/serpent"
 )
 
@@ -85,27 +86,17 @@ func (r *RootCmd) aiGatewayStart() *serpent.Command {
 				logger = logger.Leveled(slog.LevelDebug)
 			}
 
-			// Indexed providers (CODER_AI_GATEWAY_PROVIDER_<N>_*) are not
-			// expressed as deployment options, so parse them from the
-			// environment the same way the server command does.
-			aiProviders, err := agpl.ReadAIProvidersFromEnv(logger, os.Environ())
-			if err != nil {
-				return xerrors.Errorf("read AI providers from env: %w", err)
-			}
-			vals.AI.BridgeConfig.Providers = append(vals.AI.BridgeConfig.Providers, aiProviders...)
-
 			// Metrics and tracing are not yet exposed by standalone mode
 			// (future work), but the pool requires a metrics object and a
 			// tracer, so wire up no-op sinks.
 			metrics := aibridge.NewMetrics(prometheus.NewRegistry())
 			tracer := trace.NewNoopTracerProvider().Tracer("aibridged")
 
-			providers, err := agpl.BuildProvidersFromConfig(ctx, vals.AI.BridgeConfig, logger.Named("aibridge.providers"), metrics)
-			if err != nil {
-				return xerrors.Errorf("build ai providers: %w", err)
-			}
-
-			pool, err := aibridged.NewCachedBridgePool(aibridged.DefaultPoolOptions, providers, logger.Named("pool"), metrics, tracer)
+			// The standalone gateway has no provider env vars and no database
+			// access. It starts with an empty pool, connects to coderd over
+			// DRPC, then fetches the provider set via GetAIProviders and builds
+			// the pool from it.
+			pool, err := aibridged.NewCachedBridgePool(aibridged.DefaultPoolOptions, nil, logger.Named("pool"), metrics, tracer)
 			if err != nil {
 				return xerrors.Errorf("create request pool: %w", err)
 			}
@@ -116,6 +107,15 @@ func (r *RootCmd) aiGatewayStart() *serpent.Command {
 				return xerrors.Errorf("start aibridge daemon: %w", err)
 			}
 			defer srv.Close()
+
+			// Fetch the initial provider set from coderd, retrying until
+			// success. srv.Client() blocks until the daemon connects; an empty
+			// provider list is a valid result and ends the loop. The standalone
+			// gateway has no refresh trigger until AIGOV-465, so this runs once
+			// on startup.
+			if err := initStandaloneProviders(ctx, srv, pool, vals.AI.BridgeConfig, logger.Named("aibridge.providers"), metrics); err != nil {
+				return xerrors.Errorf("initialize ai providers: %w", err)
+			}
 
 			// The standalone listener is dedicated to Gateway traffic, so
 			// the daemon is served at the root. The /api/v2/aibridge alias
@@ -205,4 +205,41 @@ func (r *RootCmd) aiGatewayStart() *serpent.Command {
 	cmd.Options = append(cmd.Options, aiGatewayOpts...)
 
 	return cmd
+}
+
+// initStandaloneProviders fetches the AI provider set from coderd over DRPC
+// and populates the pool, retrying until it succeeds or ctx is canceled.
+// srv.Client() blocks until the daemon connects to coderd; GetAIProviders may
+// still fail transiently (e.g. mid-seed contention or a dropped connection),
+// so the whole fetch is retried with backoff. A successful empty list is a
+// valid result and ends the loop.
+//
+// The standalone gateway has no provider-change refresh trigger until
+// AIGOV-465, so this runs once on startup; provider add/enable will not
+// propagate to a running standalone gateway.
+func initStandaloneProviders(
+	ctx context.Context,
+	srv *aibridged.Server,
+	pool *aibridged.CachedBridgePool,
+	cfg codersdk.AIBridgeConfig,
+	logger slog.Logger,
+	metrics *aibridge.Metrics,
+) error {
+	for r := retry.New(50*time.Millisecond, 10*time.Second); r.Wait(ctx); {
+		client, err := srv.Client()
+		if err != nil {
+			// Client() only fails when the daemon is shutting down.
+			return xerrors.Errorf("get aibridge client: %w", err)
+		}
+		resp, err := client.GetAIProviders(ctx, &proto.GetAIProvidersRequest{})
+		if err != nil {
+			logger.Warn(ctx, "fetch ai providers, will retry", slog.Error(err))
+			continue
+		}
+		providers, _ := agpl.BuildProvidersFromProto(ctx, resp.GetProviders(), cfg, logger, metrics)
+		pool.ReplaceProviders(providers)
+		logger.Info(ctx, "loaded ai providers from coderd", slog.F("count", len(providers)))
+		return nil
+	}
+	return ctx.Err()
 }
