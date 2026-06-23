@@ -12,11 +12,6 @@ import (
 	"github.com/coder/quartz"
 )
 
-// CurrentSchemaVersion is the on-wire shape version. Bump
-// whenever the resource format changes in a way that requires
-// coderd-side awareness.
-const CurrentSchemaVersion uint64 = 1
-
 // ManagerOptions configures a Manager. Zero values get sensible
 // defaults.
 type ManagerOptions struct {
@@ -40,15 +35,18 @@ type ManagerOptions struct {
 	// directly; production callers leave it unset.
 	AllowedRoots []string
 	// Resolver, when non-nil, replaces the default resolver.
-	// Tests use this to inject MCP providers and tighten
-	// caps.
+	// Tests use this to inject MCP resources (via
+	// Resolver.MCPResources) and tighten caps.
 	Resolver *Resolver
+	// MCPCatalog, when non-nil, supplies the per-server MCP snapshot
+	// the Manager surfaces as KindMCPServer resources on every
+	// resolve. The agent injects the shared MCP engine's catalog here
+	// so discovery and execution use one set of server connections.
+	// It is ignored when the resolver already has an MCP provider
+	// (e.g. a test injecting one via Resolver).
+	MCPCatalog func() []MCPServerStatus
 	// Debounce overrides the watcher's debounce window.
 	Debounce time.Duration
-	// SchemaVersion is the version stamped on each Snapshot.
-	// Use CurrentSchemaVersion (the default) unless rolling
-	// out a schema change.
-	SchemaVersion uint64
 }
 
 // Source is a user-declared scan root added to the agent's
@@ -64,13 +62,12 @@ type Source struct {
 // Pusher fan-out. Construct with NewManager; start its lifecycle
 // goroutines with Run; tear down with Close.
 type Manager struct {
-	logger        slog.Logger
-	clock         quartz.Clock
-	workingDir    func() string
-	allowedRoots  []string
-	resolver      *Resolver
-	debounce      time.Duration
-	schemaVersion uint64
+	logger       slog.Logger
+	clock        quartz.Clock
+	workingDir   func() string
+	allowedRoots []string
+	resolver     *Resolver
+	debounce     time.Duration
 
 	mu      sync.Mutex
 	sources []Source
@@ -124,34 +121,42 @@ func NewManager(opts ManagerOptions) *Manager {
 	if debounce <= 0 {
 		debounce = DefaultWatchDebounce
 	}
-	schemaVersion := opts.SchemaVersion
-	if schemaVersion == 0 {
-		schemaVersion = CurrentSchemaVersion
-	}
 	resolver := opts.Resolver
 	if resolver == nil {
 		resolver = &Resolver{}
 	}
 
 	m := &Manager{
-		logger:        opts.Logger,
-		clock:         clock,
-		workingDir:    opts.WorkingDir,
-		allowedRoots:  append([]string(nil), opts.AllowedRoots...),
-		resolver:      resolver,
-		debounce:      debounce,
-		schemaVersion: schemaVersion,
-		sources:       make([]Source, 0),
-		sourceIndex:   make(map[string]int),
-		subscribers:   make(map[chan struct{}]struct{}),
-		trigger:       make(chan struct{}, 1),
-		closedCh:      make(chan struct{}),
-		runDoneCh:     make(chan struct{}),
-		runStartedCh:  make(chan struct{}),
+		logger:       opts.Logger,
+		clock:        clock,
+		workingDir:   opts.WorkingDir,
+		allowedRoots: append([]string(nil), opts.AllowedRoots...),
+		resolver:     resolver,
+		debounce:     debounce,
+		sources:      make([]Source, 0),
+		sourceIndex:  make(map[string]int),
+		subscribers:  make(map[chan struct{}]struct{}),
+		trigger:      make(chan struct{}, 1),
+		closedCh:     make(chan struct{}),
+		runDoneCh:    make(chan struct{}),
+		runStartedCh: make(chan struct{}),
+	}
+
+	// Surface the shared MCP engine's catalog as KindMCPServer
+	// resources unless the resolver already has a provider (tests
+	// inject one via Resolver). The engine owns the connection
+	// lifecycle and notifies this Manager via Trigger when its
+	// catalog changes (see agent wiring). The provider must be wired
+	// before the eager first resolve below so the seam is present
+	// from the first snapshot.
+	if resolver.MCPResources == nil && opts.MCPCatalog != nil {
+		resolver.MCPResources = func() []Resource {
+			return buildMCPServerResources(opts.MCPCatalog())
+		}
 	}
 
 	for _, s := range opts.InitialSources {
-		canonical, err := CanonicalizePath(s.Path)
+		identity, err := lexicalPath(s.Path)
 		if err != nil {
 			// Initial sources may not exist yet at boot
 			// time; log and skip rather than abort the
@@ -162,11 +167,7 @@ func NewManager(opts ManagerOptions) *Manager {
 				slog.Error(err))
 			continue
 		}
-		if _, ok := m.sourceIndex[canonical]; ok {
-			continue
-		}
-		m.sourceIndex[canonical] = len(m.sources)
-		m.sources = append(m.sources, Source{Path: canonical})
+		m.addSourceLocked(identity)
 	}
 
 	// First snapshot is computed eagerly. The push protocol
@@ -203,7 +204,6 @@ func (m *Manager) Run(ctx context.Context) error {
 		Logger:   m.logger.Named("watcher"),
 		Clock:    m.clock,
 		Debounce: m.debounce,
-		MaxDepth: m.resolver.MaxDepth,
 		OnChange: m.signal,
 	})
 	if err != nil {
@@ -276,11 +276,10 @@ func (m *Manager) Sources() []Source {
 	return out
 }
 
-// HasSource reports whether path matches an existing source
-// after canonicalization. Returns the canonical path on
-// success.
+// HasSource reports whether path matches a registered source,
+// returning its lexical identity.
 func (m *Manager) HasSource(path string) (canonical string, ok bool) {
-	c, err := CanonicalizePath(path)
+	c, err := lexicalPath(path)
 	if err != nil {
 		return "", false
 	}
@@ -290,46 +289,45 @@ func (m *Manager) HasSource(path string) (canonical string, ok bool) {
 	return c, ok
 }
 
-// AddSource adds a new source. The path is canonicalized and
-// validated against the AllowedRoots set. AddSource is
+// AddSource validates a new source against the AllowedRoots set
+// and registers it by its lexical identity. AddSource is
 // idempotent.
 func (m *Manager) AddSource(s Source) (Source, error) {
-	canonical, err := CanonicalizePath(s.Path)
+	identity, err := lexicalPath(s.Path)
 	if err != nil {
 		return Source{}, xerrors.Errorf("canonicalize: %w", err)
 	}
-	if err := ValidateSourcePath(canonical, m.effectiveAllowedRoots()); err != nil {
+	// Validate the resolved path so symlinks can't escape the allowed roots.
+	resolved, err := CanonicalizePath(s.Path)
+	if err != nil {
+		return Source{}, xerrors.Errorf("canonicalize: %w", err)
+	}
+	if err := ValidateSourcePath(resolved, m.effectiveAllowedRoots()); err != nil {
 		return Source{}, err
 	}
 
 	m.mu.Lock()
-	if _, ok := m.sourceIndex[canonical]; ok {
-		out := m.sources[m.sourceIndex[canonical]]
+	if idx, ok := m.sourceIndex[identity]; ok {
+		out := m.sources[idx]
 		m.mu.Unlock()
 		return out, nil
 	}
-	m.sourceIndex[canonical] = len(m.sources)
-	m.sources = append(m.sources, Source{Path: canonical})
+	m.sourceIndex[identity] = len(m.sources)
+	m.sources = append(m.sources, Source{Path: identity})
 	m.mu.Unlock()
 
 	m.signal()
-	return Source{Path: canonical}, nil
+	return Source{Path: identity}, nil
 }
 
-// SeedSources canonicalizes and inserts a batch of trusted
-// sources without applying AllowedRoots validation. It is the
-// late-binding equivalent of ManagerOptions.InitialSources for
-// callers that need the working directory to resolve relative
-// paths but only learn the working directory after Run has
-// started. Paths that fail canonicalization are silently
-// skipped, matching the boot-time seeding contract. SeedSources
-// is idempotent: previously seeded canonical paths are
-// deduplicated via the existing source index.
+// SeedSources registers a batch of trusted sources without
+// AllowedRoots validation, the late-binding equivalent of
+// ManagerOptions.InitialSources for when the working directory
+// is only known after Run starts. Invalid paths are skipped and
+// duplicates are ignored.
 //
-// AddSource is the correct entry point for untrusted HTTP
-// callers; this method exists only for the agent's manifest-
-// triggered seeding from CODER_AGENT_EXP_*_DIRS, where the
-// template author already authorized the paths.
+// Untrusted callers must use AddSource; SeedSources exists only
+// for manifest-triggered seeding from CODER_AGENT_EXP_*_DIRS.
 func (m *Manager) SeedSources(sources []Source) {
 	if len(sources) == 0 {
 		return
@@ -337,7 +335,7 @@ func (m *Manager) SeedSources(sources []Source) {
 	m.mu.Lock()
 	changed := false
 	for _, s := range sources {
-		canonical, err := CanonicalizePath(s.Path)
+		identity, err := lexicalPath(s.Path)
 		if err != nil {
 			m.logger.Warn(context.Background(),
 				"skipping invalid seeded source",
@@ -345,12 +343,9 @@ func (m *Manager) SeedSources(sources []Source) {
 				slog.Error(err))
 			continue
 		}
-		if _, ok := m.sourceIndex[canonical]; ok {
-			continue
+		if m.addSourceLocked(identity) {
+			changed = true
 		}
-		m.sourceIndex[canonical] = len(m.sources)
-		m.sources = append(m.sources, Source{Path: canonical})
-		changed = true
 	}
 	m.mu.Unlock()
 	if changed {
@@ -358,11 +353,10 @@ func (m *Manager) SeedSources(sources []Source) {
 	}
 }
 
-// RemoveSource removes the source matching path. Path is
-// canonicalized before matching. Returns ErrSourceNotFound when
-// no such source exists or when the path cannot be canonicalized.
+// RemoveSource removes the source matching path by its lexical
+// identity, returning ErrSourceNotFound if none matches.
 func (m *Manager) RemoveSource(path string) error {
-	canonical, err := CanonicalizePath(path)
+	identity, err := lexicalPath(path)
 	if err != nil {
 		// A path that does not canonicalize cannot match any
 		// existing source. Mirror HasSource semantics by
@@ -372,7 +366,7 @@ func (m *Manager) RemoveSource(path string) error {
 	}
 
 	m.mu.Lock()
-	idx, ok := m.sourceIndex[canonical]
+	idx, ok := m.sourceIndex[identity]
 	if !ok {
 		m.mu.Unlock()
 		return ErrSourceNotFound
@@ -380,7 +374,7 @@ func (m *Manager) RemoveSource(path string) error {
 	// O(n) compaction is fine for the typical handful of
 	// user-added sources.
 	m.sources = append(m.sources[:idx], m.sources[idx+1:]...)
-	delete(m.sourceIndex, canonical)
+	delete(m.sourceIndex, identity)
 	for i := idx; i < len(m.sources); i++ {
 		m.sourceIndex[m.sources[i].Path] = i
 	}
@@ -388,6 +382,17 @@ func (m *Manager) RemoveSource(path string) error {
 
 	m.signal()
 	return nil
+}
+
+// addSourceLocked registers identity unless already present,
+// reporting whether it was added. m.mu must be held.
+func (m *Manager) addSourceLocked(identity string) bool {
+	if _, ok := m.sourceIndex[identity]; ok {
+		return false
+	}
+	m.sourceIndex[identity] = len(m.sources)
+	m.sources = append(m.sources, Source{Path: identity})
+	return true
 }
 
 // Snapshot returns the latest Snapshot. The returned value is
@@ -442,7 +447,6 @@ func (m *Manager) Resync(ctx context.Context) (Snapshot, error) {
 	roots := m.scanRootsLocked()
 	resolver := m.resolver
 	watcher := m.watcher
-	schemaVersion := m.schemaVersion
 	m.resolveEpoch++
 	myEpoch := m.resolveEpoch
 	m.mu.Unlock()
@@ -464,7 +468,6 @@ func (m *Manager) Resync(ctx context.Context) (Snapshot, error) {
 			snap.SnapshotError = d
 		}
 	}
-	snap.SchemaVersion = schemaVersion
 
 	m.mu.Lock()
 	if m.closed {
@@ -539,6 +542,13 @@ func (m *Manager) scanRootsLocked() []ScanRoot {
 	out := make([]ScanRoot, 0, 1+len(builtinRoots)+len(m.sources))
 	if m.workingDir != nil {
 		if wd := strings.TrimSpace(m.workingDir()); wd != "" {
+			// The working directory is a single scan root. The
+			// resolver reads its top-level instruction files and
+			// .mcp.json plus the fixed skill containers under it;
+			// it neither descends into subdirectories nor climbs
+			// to parent directories. Additional directories are
+			// added explicitly as Sources or via the seeding env
+			// vars.
 			out = append(out, ScanRoot{Path: wd})
 		}
 	}
@@ -592,7 +602,6 @@ func (m *Manager) resolveAndBroadcast(ctx context.Context) {
 	roots := m.scanRootsLocked()
 	resolver := m.resolver
 	watcher := m.watcher
-	schemaVersion := m.schemaVersion
 	m.resolveEpoch++
 	myEpoch := m.resolveEpoch
 	m.mu.Unlock()
@@ -617,7 +626,6 @@ func (m *Manager) resolveAndBroadcast(ctx context.Context) {
 			snap.SnapshotError = d
 		}
 	}
-	snap.SchemaVersion = schemaVersion
 
 	m.mu.Lock()
 	if m.resolveEpoch != myEpoch {
@@ -656,7 +664,6 @@ func (m *Manager) resolveLocked() {
 	snap := m.resolver.Resolve(roots)
 	m.version++
 	snap.Version = m.version
-	snap.SchemaVersion = m.schemaVersion
 	// Surface watcher degradation as a snapshot-level error
 	// when the resolver did not already emit one.
 	if snap.SnapshotError == "" && m.watcher != nil {

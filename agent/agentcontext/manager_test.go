@@ -61,7 +61,6 @@ func TestManager_InitialSnapshotIsPopulated(t *testing.T) {
 
 	snap := m.Snapshot()
 	require.Equal(t, uint64(1), snap.Version)
-	require.Equal(t, agentcontext.CurrentSchemaVersion, snap.SchemaVersion)
 	require.Len(t, snap.Resources, 1)
 }
 
@@ -170,6 +169,40 @@ func TestManager_AddSourceIsIdempotent(t *testing.T) {
 
 	sources := m.Sources()
 	require.Len(t, sources, 1)
+}
+
+// TestManager_SourceIdentityIsLexicalAndStable verifies the same configured
+// source added before and after its symlink target exists collapses to one
+// source keyed by the lexical (configured) path, not the resolved target.
+func TestManager_SourceIdentityIsLexicalAndStable(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks require admin privileges on Windows runners")
+	}
+	root := testutil.TempDirResolved(t)
+	target := filepath.Join(root, "target")
+	link := filepath.Join(root, "link")
+	require.NoError(t, os.Symlink(target, link))
+
+	m := newTestManager(t, agentcontext.ManagerOptions{
+		WorkingDir:   func() string { return root },
+		AllowedRoots: []string{root},
+	})
+
+	// Target missing: identity is the lexical link path.
+	added1, err := m.AddSource(agentcontext.Source{Path: link})
+	require.NoError(t, err)
+	require.Equal(t, link, added1.Path)
+
+	// Once the target exists the link resolves, but the same configured
+	// path must still dedupe to one source.
+	require.NoError(t, os.MkdirAll(target, 0o755))
+	added2, err := m.AddSource(agentcontext.Source{Path: link})
+	require.NoError(t, err)
+	require.Equal(t, link, added2.Path,
+		"expected the source identity to stay the lexical link path")
+
+	require.Len(t, m.Sources(), 1)
 }
 
 func TestManager_RemoveSource(t *testing.T) {
@@ -395,4 +428,70 @@ func TestManager_SubscribeBroadcastOnChange(t *testing.T) {
 	case <-time.After(testutil.WaitShort):
 		t.Fatal("expected subscriber to be notified")
 	}
+}
+
+// TestManager_MCPResourcesAppliesToSnapshot verifies that MCP resources
+// supplied via the resolver contribute KindMCPServer resources (with
+// their tools) to the resolved snapshot.
+func TestManager_MCPResourcesAppliesToSnapshot(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	m := newTestManager(t, agentcontext.ManagerOptions{
+		WorkingDir: func() string { return dir },
+		Resolver: &agentcontext.Resolver{
+			MCPResources: func() []agentcontext.Resource {
+				return []agentcontext.Resource{{
+					ID:     "mcp_server:fs",
+					Kind:   agentcontext.KindMCPServer,
+					Source: "fs",
+					Name:   "fs",
+					Status: agentcontext.StatusOK,
+					Tools:  []agentcontext.MCPTool{{Name: "read", Description: "Read"}},
+				}}
+			},
+		},
+	})
+
+	snap := m.Snapshot()
+	var found bool
+	for _, r := range snap.Resources {
+		if r.Kind == agentcontext.KindMCPServer && r.Source == "fs" {
+			found = true
+			require.Len(t, r.Tools, 1)
+			require.Equal(t, "read", r.Tools[0].Name)
+		}
+	}
+	require.True(t, found, "expected MCP server resource in snapshot")
+}
+
+// TestManager_WorkingDirScannedShallow confirms the working
+// directory is a single scan root: its top-level instruction files
+// are read, but the resolver neither climbs to an ancestor (no
+// walk-up to a .git project root) nor descends into subdirectories.
+func TestManager_WorkingDirScannedShallow(t *testing.T) {
+	t.Parallel()
+	root := testutil.TempDirResolved(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".git"), 0o755))
+	mustWriteFile(t, filepath.Join(root, "AGENTS.md"), "root rules")
+	cwd := filepath.Join(root, "service")
+	require.NoError(t, os.MkdirAll(cwd, 0o755))
+	mustWriteFile(t, filepath.Join(cwd, "AGENTS.md"), "service rules")
+	// A subdirectory below the working dir must not be descended.
+	mustWriteFile(t, filepath.Join(cwd, "nested", "AGENTS.md"), "nested rules")
+
+	m := newTestManager(t, agentcontext.ManagerOptions{
+		WorkingDir: func() string { return cwd },
+	})
+
+	snap := m.Snapshot()
+	var sources []string
+	for _, r := range snap.Resources {
+		if r.Kind == agentcontext.KindInstructionFile {
+			sources = append(sources, r.Source)
+		}
+	}
+	// Only the working directory's own AGENTS.md is present: the
+	// ancestor root and the nested subdirectory are both excluded.
+	require.Equal(t, []string{filepath.Join(cwd, "AGENTS.md")}, sources)
 }

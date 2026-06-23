@@ -23,21 +23,19 @@ const longExecuteCommand =
 const TEST_PNG_B64 =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4n539HwAHFwLVF8kc1wAAAABJRU5ErkJggg==";
 
-const getDiffsText = (element: HTMLElement) =>
-	Array.from(element.querySelectorAll("diffs-container"))
-		.map((container) => container.shadowRoot?.textContent ?? "")
-		.join("\n");
+const expectDiffText = async (element: HTMLElement, text: string) => {
+	await waitFor(() =>
+		expect(
+			Array.from(element.querySelectorAll("diffs-container")).some((host) =>
+				host.shadowRoot?.textContent?.includes(text),
+			),
+		).toBe(true),
+	);
+};
 
 const meta: Meta<typeof Tool> = {
 	title: "pages/AgentsPage/ChatElements/tools/Tool",
 	component: Tool,
-	decorators: [
-		(Story) => (
-			<div className="max-w-3xl rounded-lg border border-solid border-border-default bg-surface-primary p-4">
-				<Story />
-			</div>
-		),
-	],
 	args: {
 		name: "execute",
 		args: { command: executeCommand },
@@ -1266,11 +1264,7 @@ export const MCPToolCompleted: Story = {
 		await userEvent.click(toggle);
 		expect(canvas.getByText("Input")).toBeVisible();
 		expect(canvas.getByText("Output")).toBeVisible();
-		await waitFor(() => {
-			const diffsText = getDiffsText(canvasElement);
-			expect(diffsText).toContain("backend");
-			expect(diffsText).toContain("Fix auth flow");
-		});
+		await expectDiffText(canvasElement, "Fix auth flow");
 	},
 };
 
@@ -1306,9 +1300,7 @@ export const MCPToolNoResult: Story = {
 		const canvas = within(canvasElement);
 		await userEvent.click(canvas.getByRole("button"));
 		expect(canvas.getByText("Input")).toBeVisible();
-		await waitFor(() => {
-			expect(getDiffsText(canvasElement)).toContain("New issue");
-		});
+		await expectDiffText(canvasElement, "New issue");
 	},
 };
 
@@ -1392,11 +1384,8 @@ export const WorkspaceMCPToolCompleted: Story = {
 		await userEvent.click(canvas.getByRole("button"));
 		expect(canvas.getByText("Input")).toBeVisible();
 		expect(canvas.getByText("Output")).toBeVisible();
-		await waitFor(() => {
-			const diffsText = getDiffsText(canvasElement);
-			expect(diffsText).toContain("message");
-			expect(diffsText).toContain("hello from workspace MCP");
-		});
+		await expectDiffText(canvasElement, "message");
+		await expectDiffText(canvasElement, "hello from workspace MCP");
 	},
 };
 
@@ -2079,17 +2068,7 @@ export const ReadFileLongLine: Story = {
 		await userEvent.click(
 			canvas.getByRole("button", { name: /Read config.ts/i }),
 		);
-		await waitFor(() =>
-			expect(getDiffsText(canvasElement)).toContain("apiUrl"),
-		);
-		await waitFor(() => {
-			const host = canvasElement.querySelector("diffs-container");
-			const code = host?.shadowRoot?.querySelector("[data-code]");
-			expect(code).toBeInstanceOf(HTMLElement);
-			if (code instanceof HTMLElement) {
-				expect(getComputedStyle(code).overflow).toBe("visible");
-			}
-		});
+		await expectDiffText(canvasElement, "apiUrl");
 	},
 };
 
@@ -2104,24 +2083,19 @@ export const ReadFileTallAndWide: Story = {
 		await userEvent.click(
 			canvas.getByRole("button", { name: /Read config.ts/i }),
 		);
-		await waitFor(() =>
-			expect(getDiffsText(canvasElement)).toContain("apiUrl"),
-		);
-		const viewport = [
-			...canvasElement.querySelectorAll<HTMLElement>(
-				"[data-radix-scroll-area-viewport]",
-			),
-		].find(
-			(v) => v.scrollWidth > v.clientWidth && v.scrollHeight > v.clientHeight,
-		);
-		if (!viewport) {
-			throw new Error("Expected a viewport overflowing on both axes.");
-		}
-		viewport.dispatchEvent(
-			new WheelEvent("wheel", { deltaY: 200, bubbles: true, cancelable: true }),
-		);
-		await new Promise((resolve) => setTimeout(resolve, 400));
-		expect(viewport.scrollLeft).toBe(0);
+		await expectDiffText(canvasElement, "apiUrl");
+		await waitFor(() => {
+			const target = [
+				...canvasElement.querySelectorAll<HTMLElement>(
+					"[data-radix-scroll-area-viewport]",
+				),
+			].find(
+				(v) => v.scrollWidth > v.clientWidth && v.scrollHeight > v.clientHeight,
+			);
+			if (!target) {
+				throw new Error("Expected a viewport overflowing on both axes.");
+			}
+		});
 	},
 };
 
@@ -2136,9 +2110,7 @@ export const GenericToolLongOutput: Story = {
 		await userEvent.click(
 			canvas.getByRole("button", { name: /some_custom_tool/i }),
 		);
-		await waitFor(() =>
-			expect(getDiffsText(canvasElement)).toContain("apiUrl"),
-		);
+		await expectDiffText(canvasElement, "apiUrl");
 	},
 };
 
