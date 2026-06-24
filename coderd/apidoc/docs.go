@@ -549,6 +549,42 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/experimental/chats/{chat}/cost": {
+            "get": {
+                "description": "Experimental: this endpoint is subject to change.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Chats"
+                ],
+                "summary": "Get chat cost",
+                "operationId": "get-chat-cost",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Chat ID",
+                        "name": "chat",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/codersdk.ChatCost"
+                        }
+                    }
+                },
+                "security": [
+                    {
+                        "CoderSessionToken": []
+                    }
+                ]
+            }
+        },
         "/api/experimental/chats/{chat}/diff": {
             "get": {
                 "description": "Experimental: this endpoint is subject to change.",
@@ -16595,6 +16631,24 @@ const docTemplate = `{
                 },
                 "debug_logging_enabled": {
                     "type": "boolean"
+                }
+            }
+        },
+        "codersdk.ChatCost": {
+            "type": "object",
+            "properties": {
+                "priced_message_count": {
+                    "type": "integer"
+                },
+                "root_chat_id": {
+                    "type": "string",
+                    "format": "uuid"
+                },
+                "total_cost_micros": {
+                    "type": "integer"
+                },
+                "unpriced_message_count": {
+                    "type": "integer"
                 }
             }
         },
